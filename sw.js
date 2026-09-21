@@ -1,4 +1,4 @@
-const CACHE_NAME = "ejimpitan-v6-firebase-20260921";
+const CACHE_NAME = "ejimpitan-v7.1-20260921";
 const APP_SHELL = [
   "./",
   "./index.html",
@@ -21,7 +21,7 @@ self.addEventListener("activate", event => {
   event.waitUntil(
     caches.keys()
       .then(keys => Promise.all(
-        keys.filter(k => k !== CACHE_NAME).map(k => caches.delete(k))
+        keys.filter(k => k.startsWith("ejimpitan-") && k !== CACHE_NAME).map(k => caches.delete(k))
       ))
       .then(() => self.clients.claim())
   );

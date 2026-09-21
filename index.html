@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>E-Jimpitan V5 - Firebase Realtime</title>
+    <title>E-Jimpitan V7.1 - Firebase Realtime</title>
     
     <!-- Meta Aplikasi Web Standalone / PWA -->
     <meta name="theme-color" content="#16a34a">
@@ -13,6 +13,10 @@
     <meta name="application-name" content="E-Jimpitan">
     <meta name="description" content="Sistem Informasi & E-Jimpitan Warga Pekon Panggungrejo Utara">
     <link id="manifest-link" rel="manifest" href="./manifest.json">
+    <link rel="preconnect" href="https://www.gstatic.com" crossorigin>
+    <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
+    <link rel="preconnect" href="https://cdnjs.cloudflare.com" crossorigin>
+    <link rel="preconnect" href="https://unpkg.com" crossorigin>
     <link rel="apple-touch-icon" href="./icon-192.png">
     <link rel="icon" type="image/png" href="./icon-192.png">
 
@@ -52,6 +56,8 @@
                 box-sizing: border-box;
             }
             #printable-area-laporan { width: 100%; max-width: 281mm; font-size: 8.5pt; }
+            #printable-area-laporan table { page-break-inside: auto; }
+            #printable-area-laporan tr { page-break-inside: avoid; page-break-after: auto; }
             #printable-area-laporan table { width: 100%; table-layout: fixed; }
             #printable-area-laporan th, #printable-area-laporan td { overflow-wrap: anywhere; word-break: normal; }
             .laporan-penarikan-nominal {
@@ -700,7 +706,7 @@
             <input type="hidden" id="form-warga-id">
             <div>
                 <label class="block text-xs font-bold text-slate-700 mb-1">NIK</label>
-                <input type="number" id="form-warga-nik" required class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm bg-slate-50 focus:outline-none focus:border-brand-500">
+                <input type="text" inputmode="numeric" autocomplete="off" maxlength="20" id="form-warga-nik" required class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm bg-slate-50 focus:outline-none focus:border-brand-500">
             </div>
             <div>
                 <label class="block text-xs font-bold text-slate-700 mb-1">Nama Lengkap</label>
@@ -783,6 +789,8 @@
         <span id="toast-msg">Pesan Notifikasi</span>
     </div>
 
+</main>
+
     <!-- Printable Area QR Batch -->
     <div id="printable-area" class="hidden font-sans">
         <div class="text-center mb-4 border-b-2 border-black pb-2">
@@ -851,11 +859,14 @@
 
     <!-- Script Utama Aplikasi -->
     
+
 <script type="module">
     import { initializeApp, deleteApp } from "https://www.gstatic.com/firebasejs/12.19.0/firebase-app.js";
     import {
         getAuth,
+        initializeAuth,
         setPersistence,
+        indexedDBLocalPersistence,
         browserLocalPersistence,
         signInWithEmailAndPassword,
         signOut,
@@ -872,24 +883,28 @@
         runTransaction,
         onChildAdded,
         onChildChanged,
-        onChildRemoved
+        onChildRemoved,
+        query,
+        orderByChild,
+        startAt,
+        endAt
     } from "https://www.gstatic.com/firebasejs/12.19.0/firebase-database.js";
 
     import { firebaseConfig } from "./firebase-config.js";
 
     /* ============================================================
-     * E-JIMPITAN V5 - FIREBASE REALTIME
+     * E-JIMPITAN V7.1 - FIREBASE REALTIME
      * Frontend-only deployment for GitHub Pages.
      * Firebase Authentication handles identity; Realtime Database
      * handles application data, authorization rules and realtime sync.
      * ============================================================ */
 
     const FIREBASE_SDK_VERSION = "12.19.0";
-    const APP_VERSION = "6.0.0-FIREBASE";
+    const APP_VERSION = "7.1.0-FIREBASE-FIXED";
     const INITIAL_ADMIN_USERNAME = "admin";
     const RECENT_TX_LIMIT = 80;
-    const CACHE_VERSION = "ejimpitan_firebase_v6";
-    const CACHE_RESET_KEY = "ejimpitan_firebase_initial_reset_v2";
+    const CACHE_VERSION = "ejimpitan_firebase_v71";
+    const CACHE_RESET_KEY = "ejimpitan_firebase_initial_reset_v3";
     const THEME_KEY = "ejimpitan_theme_v42";
 
     const STORAGE_KEYS = {
@@ -913,6 +928,10 @@
     let pendingLoginUsername = null;
     let authReady = false;
     let realtimeUnsubs = [];
+    let realtimeHydrating = false;
+    let realtimeGeneration = 0;
+    let renderRequestedDuringHydration = false;
+    let printCleanupTimer = null;
 
     const APP_STATE = {
         wargaList: [],
@@ -1153,9 +1172,57 @@
         localStorage.setItem(STORAGE_KEYS.QUEUE, JSON.stringify(q || []));
     }
 
+    const FIREBASE_PATH_INVALID_RE = /[.#$\[\]\/\u0000-\u001F\u007F]/;
+
+    function validateDbSegment(value, label = "Key") {
+        const segment = String(value ?? "").trim();
+        if (!segment) throw appError(`${label} Firebase tidak boleh kosong.`, "INVALID_DB_PATH");
+        if (FIREBASE_PATH_INVALID_RE.test(segment)) {
+            throw appError(`${label} Firebase tidak valid. Hindari karakter . # $ / [ ] dan karakter kontrol.`, "INVALID_DB_PATH");
+        }
+        const bytes = new TextEncoder().encode(segment).length;
+        if (bytes > 768) throw appError(`${label} Firebase terlalu panjang.`, "INVALID_DB_PATH");
+        return segment;
+    }
+
+    function validateDbPathString(path) {
+        const value = String(path ?? "");
+        if (!value) return value;
+        value.split("/").filter(Boolean).forEach((part, idx) => validateDbSegment(part, `Segmen path #${idx + 1}`));
+        return value;
+    }
+
+    function validateUpdateMap(updates) {
+        for (const key of Object.keys(updates || {})) validateDbPathString(key);
+        return updates;
+    }
+
+    async function multiPathUpdate(updates) {
+        validateUpdateMap(updates);
+        return update(dbPath(""), updates);
+    }
+
     function dbPath(path) {
         if (!db) throw appError("Firebase belum siap.", "FIREBASE_NOT_READY");
-        return ref(db, path);
+        const safePath = validateDbPathString(path);
+        return ref(db, safePath);
+    }
+
+    function userCacheKey(uid) {
+        return `${CACHE_VERSION}_profile_${validateDbSegment(uid, "UID")}`;
+    }
+
+    function saveUserProfileCache(profile) {
+        if (!profile?.id) return;
+        try {
+            localStorage.setItem(userCacheKey(profile.id), JSON.stringify({ ...profile, cachedAt: Date.now() }));
+        } catch (_) {}
+    }
+
+    function loadUserProfileCache(uid) {
+        if (!uid) return null;
+        const data = safeJsonParse(localStorage.getItem(userCacheKey(uid)) || "null", null);
+        return data && data.status === "ACTIVE" ? normalizeUser(data) : null;
     }
 
     function makeAuthEmail(username) {
@@ -1195,6 +1262,7 @@
 
     async function handleFirebaseAuthState(firebaseUser) {
         if (!firebaseUser) {
+            realtimeGeneration++;
             stopRealtimeListeners();
             if (APP_STATE.isPublic) {
                 authReady = true;
@@ -1211,20 +1279,42 @@
         }
 
         try {
+            // Render from a trusted, previously cached profile immediately, then refresh
+            // from Firebase. This shortens the perceived login-to-dashboard delay.
+            const cachedProfile = loadUserProfileCache(firebaseUser.uid);
+            if (cachedProfile) {
+                pendingLoginUsername = null;
+                APP_STATE.currentUser = cachedProfile;
+                APP_STATE.isPublic = cachedProfile.role === "WARGA";
+                loadCache(cachedProfile.id);
+                applyUserRoleUI();
+                renderDashboard();
+                if (cachedProfile.role === "SUPERADMIN") {
+                    renderWargaTable();
+                    renderPetugasTable();
+                }
+                setLoginStatus("Sesi dipulihkan dari cache. Memvalidasi...");
+            }
+
             const profile = await loadUserProfile(firebaseUser);
+            saveUserProfileCache(profile);
             pendingLoginUsername = null;
+            const profileChanged = !APP_STATE.currentUser || APP_STATE.currentUser.id !== profile.id ||
+                JSON.stringify(APP_STATE.currentUser) !== JSON.stringify(profile);
             APP_STATE.currentUser = profile;
             APP_STATE.isPublic = profile.role === "WARGA";
             loadCache(profile.id);
             applyUserRoleUI();
-            startRealtimeListeners();
+            if (profileChanged || realtimeUnsubs.length === 0) {
+                await startRealtimeListeners();
+            }
             renderDashboard();
             if (profile.role === "SUPERADMIN") {
                 renderWargaTable();
                 renderPetugasTable();
             }
-            setLoginStatus("Firebase Auth terhubung.");
-            showToast(`Login berhasil. Halo, ${profile.nama}!`);
+            setLoginStatus("Firebase Auth terhubung • Realtime aktif.");
+            if (!cachedProfile) showToast(`Login berhasil. Halo, ${profile.nama}!`);
             flushOfflineQueue().catch(() => {});
         } catch (err) {
             await signOut(firebaseAuth).catch(() => {});
@@ -1379,6 +1469,10 @@
     }
 
     function scheduleRender() {
+        if (realtimeHydrating) {
+            renderRequestedDuringHydration = true;
+            return;
+        }
         clearTimeout(renderTimer);
         renderTimer = setTimeout(() => {
             recomputeScannedToday();
@@ -1422,7 +1516,6 @@
             const idx = APP_STATE.transaksiList.findIndex(x => x.id === id);
             if (idx >= 0) APP_STATE.transaksiList[idx] = item;
             else APP_STATE.transaksiList.push(item);
-            APP_STATE.transaksiList.sort((a, b) => new Date(b.date) - new Date(a.date));
         } else if (collection === "petugas") {
             const item = normalizeUser(value);
             if (!item || !item.id) return;
@@ -1461,6 +1554,28 @@
         });
     }
 
+    function replaceCollectionFromSnapshot(collection, snap) {
+        const value = snap?.exists() ? (snap.val() || {}) : {};
+        const list = Object.entries(value).map(([id, row]) => ({ id, ...row }));
+        if (collection === "warga") {
+            APP_STATE.wargaList = list.map(normalizeWarga).filter(x => x?.id);
+        } else if (collection === "transaksi") {
+            APP_STATE.transaksiList = list.map(normalizeTx).filter(x => x?.id && x.status !== "VOID");
+        } else if (collection === "petugas") {
+            APP_STATE.petugasList = list.map(normalizeUser).filter(x => x?.id && x.status !== "INACTIVE");
+        }
+    }
+
+    async function bootstrapRealtimeCollection(path, collection, generation) {
+        // Listeners are attached before the snapshot read so no changes can be missed
+        // between the bootstrap read and the live stream. The final snapshot is used as
+        // the authoritative initial state.
+        listenChildren(path, collection);
+        const snap = await get(dbPath(path));
+        if (generation !== realtimeGeneration) return;
+        replaceCollectionFromSnapshot(collection, snap);
+    }
+
     function stopRealtimeListeners() {
         realtimeUnsubs.forEach(fn => {
             try { fn(); } catch (_) {}
@@ -1468,25 +1583,46 @@
         realtimeUnsubs = [];
     }
 
-    function startRealtimeListeners() {
+    async function startRealtimeListeners() {
         if (!db || !APP_STATE.currentUser) return;
         stopRealtimeListeners();
+        const generation = ++realtimeGeneration;
+        realtimeHydrating = true;
+        renderRequestedDuringHydration = false;
 
         const u = APP_STATE.currentUser;
         const role = String(u.role).toUpperCase();
+        const jobs = [];
 
         if (APP_STATE.isPublic || role === "WARGA") {
             loadCache("PUBLIC");
-            listenChildren("public/warga", "warga");
-            listenChildren("public/transactions", "transaksi");
+            jobs.push(bootstrapRealtimeCollection("public/warga", "warga", generation));
+            jobs.push(bootstrapRealtimeCollection("public/transactions", "transaksi", generation));
         } else if (role === "SUPERADMIN") {
-            listenChildren("warga", "warga");
-            listenChildren("transactions", "transaksi");
-            listenChildren("users", "petugas");
+            jobs.push(bootstrapRealtimeCollection("warga", "warga", generation));
+            jobs.push(bootstrapRealtimeCollection("transactions", "transaksi", generation));
+            jobs.push(bootstrapRealtimeCollection("users", "petugas", generation));
         } else if (role === "PETUGAS") {
             loadCache(u.id);
-            listenChildren(`wargaByRt/${u.rt}`, "warga");
-            listenChildren(`transactionsByRt/${u.rt}`, "transaksi");
+            const rtKey = validateDbSegment(u.rt, "RT");
+            jobs.push(bootstrapRealtimeCollection(`wargaByRt/${rtKey}`, "warga", generation));
+            jobs.push(bootstrapRealtimeCollection(`transactionsByRt/${rtKey}`, "transaksi", generation));
+        }
+
+        try {
+            await Promise.all(jobs);
+        } catch (err) {
+            if (generation === realtimeGeneration) {
+                console.warn("Realtime bootstrap:", err?.message || err);
+                showToast("Sebagian data belum tersinkron. Coba muat ulang koneksi.", "error");
+            }
+        } finally {
+            if (generation === realtimeGeneration) {
+                realtimeHydrating = false;
+                const shouldRender = renderRequestedDuringHydration;
+                renderRequestedDuringHydration = false;
+                if (shouldRender) scheduleRender();
+            }
         }
 
         setLoginStatus("Realtime Firebase aktif.");
@@ -1549,21 +1685,27 @@
         return ["SUPERADMIN", "PETUGAS"].includes(APP_STATE.currentUser?.role);
     }
 
-    async function writeAudit(action, targetId = "", detail = "") {
+    function makeAuditRecord(action, targetId = "", detail = "") {
         const u = APP_STATE.currentUser;
-        if (!u || !firebaseAuth?.currentUser) return;
+        const authUser = firebaseAuth?.currentUser;
+        if (!u || !authUser) return null;
         const id = uid("AUD");
-        const record = {
+        return {
             id,
             timestamp: Date.now(),
-            userId: firebaseAuth.currentUser.uid,
+            userId: authUser.uid,
             username: u.username,
             action: String(action || "").slice(0, 80),
             targetId: String(targetId || "").slice(0, 120),
             detail: String(detail || "").slice(0, 500)
         };
+    }
+
+    async function writeAudit(action, targetId = "", detail = "") {
+        const record = makeAuditRecord(action, targetId, detail);
+        if (!record) return false;
         try {
-            await set(dbPath(`audit/${id}`), record);
+            await set(dbPath(`audit/${record.id}`), record);
             return true;
         } catch (err) {
             console.warn("Audit log gagal disimpan:", err?.message || err);
@@ -1579,7 +1721,7 @@
 
     async function saveWargaToFirebase(data) {
         if (!isSuperadmin()) throw appError("Akses hanya untuk Superadmin.", "FORBIDDEN");
-        const id = String(data.id || uid("W"));
+        const id = data.id ? validateDbSegment(data.id, "ID warga") : uid("W");
         const nik = String(data.nik || "").trim();
         const nama = String(data.nama || "").trim();
         const rt = normalizeRt(data.rt);
@@ -1597,13 +1739,15 @@
         };
 
         const updates = {};
+        validateDbSegment(id, "ID warga");
+        validateDbSegment(rt, "RT");
         updates[`warga/${id}`] = w;
         updates[`wargaByRt/${rt}/${id}`] = w;
         updates[`public/warga/${id}`] = { id, nama, rt };
         if (old && old.rt && old.rt !== rt) {
             updates[`wargaByRt/${old.rt}/${id}`] = null;
         }
-        await update(dbPath(""), updates);
+        await multiPathUpdate(updates);
         await writeAudit(old ? "UPDATE_WARGA" : "CREATE_WARGA", id, `${nama} / ${rt}`);
         applyChildUpsert("warga", id, w);
         scheduleRender();
@@ -1612,7 +1756,7 @@
 
     async function deleteWargaToFirebase(data) {
         if (!isSuperadmin()) throw appError("Akses hanya untuk Superadmin.", "FORBIDDEN");
-        const id = String(data.id || "");
+        const id = validateDbSegment(data.id, "ID warga");
         const old = APP_STATE.wargaList.find(w => w.id === id);
         if (!old) throw appError("Data warga tidak ditemukan.", "NOT_FOUND");
         if (activeTx().some(t => t.wargaId === id)) throw appError("Warga tidak dapat dinonaktifkan karena sudah memiliki riwayat transaksi.", "HAS_TRANSACTIONS");
@@ -1623,7 +1767,7 @@
         updates[`wargaByRt/${old.rt}/${id}`] = null;
         updates[`public/warga/${id}`] = null;
         updates[`wargaArchive/${id}`] = archived;
-        await update(dbPath(""), updates);
+        await multiPathUpdate(updates);
         await writeAudit("DELETE_WARGA", id, old.nama);
         applyChildRemove("warga", id);
         scheduleRender();
@@ -1697,7 +1841,7 @@
             updates[`users/${newUid}`] = profile;
             updates[`usernames/${usernameKey}`] = { uid: newUid, username, authEmail };
             try {
-                await update(dbPath(""), updates);
+                await multiPathUpdate(updates);
                 await writeAudit("CREATE_PETUGAS", newUid, `${username} / ${role} / ${rt}`);
             } catch (err) {
                 await closeSecondaryAuth(true);
@@ -1739,7 +1883,7 @@
             if (oldUsernameKey !== newUsernameKey) updates[`usernames/${oldUsernameKey}`] = null;
             updates[`usernames/${newUsernameKey}`] = { uid: created.uid, username, authEmail };
             try {
-                await update(dbPath(""), updates);
+                await multiPathUpdate(updates);
                 await writeAudit("UPDATE_PASSWORD_PETUGAS", created.uid, `${username} / akun baru dibuat`);
             } catch (err) {
                 await closeSecondaryAuth(true);
@@ -1785,7 +1929,7 @@
         } else {
             updates[`usernames/${newUsernameKey}`] = { uid: old.id, username, authEmail: authEmailForExisting };
         }
-        await update(dbPath(""), updates);
+        await multiPathUpdate(updates);
         await writeAudit("UPDATE_PETUGAS", old.id, `${username} / ${role} / ${rt}`);
         applyChildUpsert("petugas", old.id, profile);
         scheduleRender();
@@ -1794,7 +1938,7 @@
 
     async function deletePetugasToFirebase(data) {
         if (!isSuperadmin()) throw appError("Akses hanya untuk Superadmin.", "FORBIDDEN");
-        const id = String(data.id || "");
+        const id = validateDbSegment(data.id, "UID pengguna");
         if (id === firebaseAuth.currentUser?.uid) throw appError("Akun yang sedang digunakan tidak boleh dinonaktifkan.", "SELF_DELETE");
         const old = APP_STATE.petugasList.find(p => p.id === id);
         if (!old) throw appError("Akun tidak ditemukan.", "NOT_FOUND");
@@ -1808,7 +1952,7 @@
         updates[`users/${id}`] = null;
         updates[`usersArchive/${id}`] = archived;
         updates[`usernames/${key}`] = null;
-        await update(dbPath(""), updates);
+        await multiPathUpdate(updates);
         await writeAudit("DELETE_PETUGAS", id, old.username);
         applyChildRemove("petugas", id);
         scheduleRender();
@@ -1955,11 +2099,18 @@
         if (tx.wargaId && tx.wargaId !== "SYSTEM") {
             updates[`public/transactionsByWarga/${tx.wargaId}/${tx.id}`] = makePublicTx(tx);
         }
+        updates[`clientIndex/${clientClaim.key}`] = {
+            id: tx.id, status: "DONE", createdAt: Date.now(), payload: makePublicTx(tx)
+        };
+        const audit = makeAuditRecord(
+            jenis === "PENARIKAN" ? "CREATE_WITHDRAWAL" : "CREATE_TRANSAKSI",
+            tx.id,
+            `${tx.nama || "PENARIKAN DANA"} / Rp${Math.abs(tx.nominal)}`
+        );
+        if (audit) updates[`audit/${audit.id}`] = audit;
 
         try {
-            await update(dbPath(""), updates);
-            await finishClientId(clientClaim.key, tx.id, makePublicTx(tx));
-            await writeAudit(jenis === "PENARIKAN" ? "CREATE_WITHDRAWAL" : "CREATE_TRANSAKSI", tx.id, `${tx.nama || "PENARIKAN DANA"} / Rp${Math.abs(tx.nominal)}`);
+            await multiPathUpdate(updates);
         } catch (err) {
             // A lost response can happen after Firebase has committed the write.
             // Check the authoritative transaction before rolling back duplicate guards.
@@ -1983,7 +2134,7 @@
 
     async function deleteTransactionToFirebase(data) {
         if (!isSuperadmin()) throw appError("Akses ini hanya untuk Superadmin.", "FORBIDDEN");
-        const id = String(data.id || "");
+        const id = validateDbSegment(data.id, "ID transaksi");
         const tx = activeTx().find(t => t.id === id);
         if (!tx) throw appError("Transaksi tidak ditemukan.", "NOT_FOUND");
 
@@ -2003,8 +2154,9 @@
         updates[`public/transactions/${id}`] = null;
         updates[`transactionsArchive/${id}`] = archived;
         if (clientKey) updates[`clientIndex/${clientKey}`] = null;
-        await update(dbPath(""), updates);
-        await writeAudit("VOID_TRANSAKSI", id, `Nominal awal Rp${Math.abs(Number(tx.nominal || 0))}`);
+        const audit = makeAuditRecord("VOID_TRANSAKSI", id, `Nominal awal Rp${Math.abs(Number(tx.nominal || 0))}`);
+        if (audit) updates[`audit/${audit.id}`] = audit;
+        await multiPathUpdate(updates);
 
         applyChildRemove("transaksi", id);
         scheduleRender();
@@ -2029,7 +2181,9 @@
             validateWarga(nik, nama, rt);
             if (seen.has(nik)) throw appError(`NIK duplikat di file impor: ${nik}`, "DUPLICATE_NIK");
             seen.add(nik);
-            return { id: String(item.id || "").trim() || uid("W"), nik, nama, rt };
+            const sourceId = String(item.id || "").trim();
+            const safeId = sourceId && !FIREBASE_PATH_INVALID_RE.test(sourceId) ? sourceId : uid("W");
+            return { id: safeId, nik, nama, rt };
         });
 
         const updates = {};
@@ -2067,7 +2221,7 @@
             });
         }
 
-        await update(dbPath(""), updates);
+        await multiPathUpdate(updates);
         await writeAudit("IMPORT_WARGA", "BATCH", `${normalized.length} data diproses; ${created} baru; ${updated} diperbarui.`);
         // Rebuild local list quickly from the current in-memory state.
         normalized.forEach(item => {
@@ -2296,10 +2450,8 @@
         else if (selRt !== "ALL") list = list.filter(w => w.rt === selRt);
         if (search) list = list.filter(w => String(w.nama).toLowerCase().includes(search) || String(w.nik).includes(search));
         const tbody = document.getElementById("warga-table-body");
-        tbody.innerHTML = "";
         const isAdmin = isSuperadmin();
-        list.forEach(w => {
-            tbody.innerHTML += `<tr class="hover:bg-slate-50 transition border-b border-slate-50">
+        tbody.innerHTML = list.length ? list.map(w => `<tr class="hover:bg-slate-50 transition border-b border-slate-50">
                 <td class="p-3 pl-4 font-mono text-xs text-slate-500">${escapeHtml(w.id)}</td>
                 <td class="p-3 text-slate-600">${escapeHtml(w.nik)}</td>
                 <td class="p-3 font-semibold text-slate-800">${escapeHtml(w.nama)}</td>
@@ -2309,9 +2461,7 @@
                     ${isAdmin ? `<button onclick="openModalWarga('${escapeHtml(w.id)}')" title="Edit" class="text-brand-600 hover:text-brand-800 w-7 h-7 rounded-lg bg-brand-50 inline-flex items-center justify-center"><i class="fa-solid fa-pen text-xs"></i></button>
                     <button onclick="promptDeleteWarga('${escapeHtml(w.id)}')" title="Nonaktifkan" class="text-red-600 hover:text-red-800 w-7 h-7 rounded-lg bg-red-50 inline-flex items-center justify-center"><i class="fa-solid fa-trash text-xs"></i></button>` : ""}
                 </td>
-            </tr>`;
-        });
-        if (!list.length) tbody.innerHTML = '<tr><td colspan="5" class="p-6 text-center text-slate-400 text-xs">Tidak ada data warga ditemukan.</td></tr>';
+            </tr>`).join("") : '<tr><td colspan="5" class="p-6 text-center text-slate-400 text-xs">Tidak ada data warga ditemukan.</td></tr>';
     }
 
     function openModalWarga(id = null) {
@@ -2402,14 +2552,14 @@
     function populateManualSelect(rt) {
         const sel = document.getElementById("manual-warga-select");
         if (!sel) return;
-        sel.innerHTML = '<option value="">-- Pilih Manual Warga --</option>';
         let list = activeWarga();
         if (rt && rt !== "ALL") list = list.filter(w => w.rt === rt);
-        list.sort((a,b) => String(a.nama).localeCompare(String(b.nama), "id"))
-            .forEach(w => {
-                const extra = APP_STATE.currentUser?.role === "SUPERADMIN" ? ` - NIK: ${escapeHtml(w.nik)}` : "";
-                sel.innerHTML += `<option value="${escapeHtml(w.id)}">${escapeHtml(w.nama)} (${escapeHtml(w.rt)}${extra})</option>`;
-            });
+        list.sort((a,b) => String(a.nama).localeCompare(String(b.nama), "id"));
+        const isAdmin = APP_STATE.currentUser?.role === "SUPERADMIN";
+        sel.innerHTML = '<option value="">-- Pilih Manual Warga --</option>' + list.map(w => {
+            const extra = isAdmin ? ` - NIK: ${escapeHtml(w.nik)}` : "";
+            return `<option value="${escapeHtml(w.id)}">${escapeHtml(w.nama)} (${escapeHtml(w.rt)}${extra})</option>`;
+        }).join("");
     }
 
     function processManualInput() {
@@ -2419,19 +2569,25 @@
     }
 
     function processScannedQR(qrId) {
-        if (!canInputTransaction()) return showToast("Akses input transaksi ditolak.", "error");
-        const w = activeWarga().find(x => String(x.id) === String(qrId));
-        if (!w) return showToast("QR Code warga tidak terdaftar.", "error");
+        if (!canInputTransaction()) { showToast("Akses input transaksi ditolak.", "error"); return false; }
+        const normalizedId = String(qrId ?? "").trim();
+        const w = activeWarga().find(x => String(x.id) === normalizedId);
+        if (!w) { showToast("QR Code warga tidak terdaftar.", "error"); return false; }
         if (APP_STATE.currentUser.role === "PETUGAS" && w.rt !== APP_STATE.currentUser.rt) {
-            return showToast(`Wilayah tugas Anda adalah ${APP_STATE.currentUser.rt}`, "error");
+            showToast(`Wilayah tugas Anda adalah ${APP_STATE.currentUser.rt}`, "error");
+            return false;
         }
-        if (APP_STATE.scannedToday.has(String(w.id))) return showToast(`${w.nama} sudah tercatat jimpitan hari ini.`, "error");
+        if (APP_STATE.scannedToday.has(String(w.id))) {
+            showToast(`${w.nama} sudah tercatat jimpitan hari ini.`, "error");
+            return false;
+        }
         APP_STATE.activeScanClientId = uid("CLIENT");
         document.getElementById("input-warga-id").value = w.id;
         document.getElementById("input-warga-nama").innerText = w.nama;
         document.getElementById("input-warga-rt").innerText = w.rt;
         document.getElementById("input-nominal").value = 1000;
         openModal("modal-jimpitan");
+        return true;
     }
 
     function startScanner() {
@@ -2472,20 +2628,21 @@
     function renderPetugasTable() {
         const tbody = document.getElementById("petugas-table-body");
         if (!tbody) return;
-        tbody.innerHTML = "";
-        activePetugasList().forEach(p => {
+        const uidCurrent = firebaseAuth.currentUser?.uid || "";
+        const rows = activePetugasList().map(p => {
             const roleColor = p.role === "SUPERADMIN" ? "bg-blue-100 text-blue-700" : (p.role === "WARGA" ? "bg-orange-100 text-orange-700" : "bg-slate-100 text-slate-700");
-            tbody.innerHTML += `<tr class="hover:bg-slate-50 transition border-b border-slate-50">
+            return `<tr class="hover:bg-slate-50 transition border-b border-slate-50">
                 <td class="p-3 pl-4 font-semibold text-slate-800">${escapeHtml(p.nama)}</td>
                 <td class="p-3 text-slate-600">${escapeHtml(p.username)}</td>
                 <td class="p-3"><span class="px-2 py-1 ${roleColor} rounded text-[10px] font-bold tracking-wider">${escapeHtml(p.role)}</span></td>
                 <td class="p-3 text-slate-600 font-medium">${escapeHtml(p.rt)}</td>
                 <td class="p-3 text-right pr-4 space-x-1">
                     <button onclick="openModalPetugas('${escapeHtml(p.id)}')" class="text-brand-600 hover:text-brand-800 w-7 h-7 rounded-lg bg-brand-50 inline-flex items-center justify-center"><i class="fa-solid fa-pen text-xs"></i></button>
-                    ${p.id !== (firebaseAuth.currentUser?.uid || "") ? `<button onclick="promptDeletePetugas('${escapeHtml(p.id)}')" class="text-red-600 hover:text-red-800 w-7 h-7 rounded-lg bg-red-50 inline-flex items-center justify-center"><i class="fa-solid fa-trash text-xs"></i></button>` : ""}
+                    ${p.id !== uidCurrent ? `<button onclick="promptDeletePetugas('${escapeHtml(p.id)}')" class="text-red-600 hover:text-red-800 w-7 h-7 rounded-lg bg-red-50 inline-flex items-center justify-center"><i class="fa-solid fa-trash text-xs"></i></button>` : ""}
                 </td>
             </tr>`;
         });
+        tbody.innerHTML = rows.join("");
     }
 
     function activePetugasList() {
@@ -2549,6 +2706,46 @@
         });
     }
 
+    function getLastDayOfMonthKey(yyyyMm) {
+        const [year, month] = String(yyyyMm).split("-").map(Number);
+        if (!year || !month) return "";
+        const d = new Date(Date.UTC(year, month, 0));
+        return d.toISOString().slice(0, 10);
+    }
+
+    async function fetchReportRows(rt, bulan) {
+        const role = APP_STATE.currentUser?.role || "WARGA";
+        let path = "public/transactions";
+        if (role === "SUPERADMIN") {
+            path = rt === "ALL" ? "transactions" : `transactionsByRt/${validateDbSegment(rt, "RT")}`;
+        } else if (role === "PETUGAS") {
+            path = `transactionsByRt/${validateDbSegment(APP_STATE.currentUser.rt, "RT")}`;
+        }
+
+        const base = dbPath(path);
+        const snapshot = bulan
+            ? await get(query(base, orderByChild("dateKey"), startAt(`${bulan}-01`), endAt(getLastDayOfMonthKey(bulan))))
+            : await get(base);
+        if (!snapshot.exists()) return [];
+
+        return Object.entries(snapshot.val() || {})
+            .map(([id, value]) => normalizeTx({ id, ...value }))
+            .filter(Boolean)
+            .filter(t => t.status !== "VOID")
+            .filter(t => rt === "ALL" || t.rt === rt)
+            .filter(t => !bulan || String(t.dateKey || jakartaDateKey(t.date)).slice(0, 7) === bulan)
+            .sort((a, b) => new Date(a.date) - new Date(b.date));
+    }
+
+    function cleanupPrintView(areaId = "printable-area-laporan") {
+        const area = document.getElementById(areaId);
+        area?.classList.add("hidden");
+        document.getElementById("sec-app")?.classList.remove("hidden");
+        if (printCleanupTimer) { clearTimeout(printCleanupTimer); printCleanupTimer = null; }
+        window.removeEventListener("afterprint", cleanupPrintView);
+        if (document.title.includes("— Cetak")) document.title = "E-Jimpitan V7.1 - Firebase Realtime";
+    }
+
     async function executePrintLaporan() {
         configureReportFilter();
         let rt = document.getElementById("lap-filter-rt")?.value || "ALL";
@@ -2559,11 +2756,21 @@
         if (rt !== "ALL" && !RT_LIST.includes(rt)) return showToast("Filter RT tidak valid.", "error");
         if (bulan && !/^\d{4}-\d{2}$/.test(bulan)) return showToast("Periode laporan tidak valid.", "error");
 
-        const rows = activeTx().filter(t => {
-            if (rt !== "ALL" && t.rt !== rt) return false;
-            if (bulan && String(t.dateKey || jakartaDateKey(t.date)).slice(0,7) !== bulan) return false;
-            return true;
-        }).sort((a,b) => new Date(a.date) - new Date(b.date));
+        let rows;
+        if (navigator.onLine && db) {
+            try {
+                setLoginStatus("Mengambil data laporan terbaru...");
+                rows = await fetchReportRows(rt, bulan);
+            } catch (err) {
+                console.warn("Report query failed:", err?.message || err);
+                rows = activeTx().filter(t => (rt === "ALL" || t.rt === rt) && (!bulan || String(t.dateKey || jakartaDateKey(t.date)).slice(0,7) === bulan))
+                    .sort((a,b) => new Date(a.date) - new Date(b.date));
+                showToast("Server laporan tidak dapat dibaca penuh. Menggunakan data cache.", "error");
+            }
+        } else {
+            rows = activeTx().filter(t => (rt === "ALL" || t.rt === rt) && (!bulan || String(t.dateKey || jakartaDateKey(t.date)).slice(0,7) === bulan))
+                .sort((a,b) => new Date(a.date) - new Date(b.date));
+        }
 
         const tbody = document.getElementById("print-lap-tbody");
         tbody.innerHTML = "";
@@ -2575,6 +2782,7 @@
                 const n = Number(t.nominal) || 0;
                 const isWithdrawal = String(t.jenis) === "PENARIKAN" || n < 0;
                 const tr = document.createElement("tr");
+                tr.className = isWithdrawal ? "laporan-penarikan" : "";
                 tr.innerHTML = `
                     <td class="border border-black p-1 text-center">${i+1}</td>
                     <td class="border border-black p-1">${new Date(t.date).toLocaleDateString("id-ID")}</td>
@@ -2588,10 +2796,10 @@
             tbody.appendChild(frag);
         }
 
-        const total = rows.reduce((s,t) => s + Number(t.nominal || 0), 0);
+        const total = rows.reduce((sum, t) => sum + Number(t.nominal || 0), 0);
         document.getElementById("print-lap-rt").innerText = rt === "ALL" ? "Seluruh RT (01 - 06)" : rt;
         document.getElementById("print-lap-periode").innerText = bulan
-            ? new Date(bulan + "-01").toLocaleDateString("id-ID", {month:"long", year:"numeric"})
+            ? new Date(`${bulan}-01T00:00:00+07:00`).toLocaleDateString("id-ID", {month:"long", year:"numeric"})
             : "Keseluruhan Waktu";
         const now = new Date();
         document.getElementById("print-lap-date").innerText = now.toLocaleDateString("id-ID", {day:"numeric", month:"long", year:"numeric", hour:"2-digit", minute:"2-digit"});
@@ -2600,13 +2808,25 @@
         document.getElementById("print-lap-total").innerText = `Rp ${total.toLocaleString("id-ID")}`;
 
         closeModal("modal-laporan");
-        document.getElementById("sec-app").classList.add("hidden");
-        document.getElementById("printable-area-laporan").classList.remove("hidden");
-        setTimeout(() => {
-            window.print();
-            document.getElementById("printable-area-laporan").classList.add("hidden");
-            document.getElementById("sec-app").classList.remove("hidden");
-        }, 250);
+        const area = document.getElementById("printable-area-laporan");
+        document.getElementById("sec-app")?.classList.add("hidden");
+        area.classList.remove("hidden");
+        document.title = `Laporan E-Jimpitan ${rt}${bulan ? " " + bulan : ""} — Cetak`;
+
+        // Browsers that support afterprint keep the print area until the dialog is
+        // actually closed. A generous fallback avoids leaving the app stuck in print mode.
+        window.addEventListener("afterprint", cleanupPrintView, {once:true});
+        clearTimeout(printCleanupTimer);
+        printCleanupTimer = setTimeout(() => cleanupPrintView(), 60000);
+        requestAnimationFrame(() => setTimeout(() => {
+            try {
+                window.focus();
+                window.print();
+            } catch (err) {
+                cleanupPrintView();
+                showToast("Dialog cetak tidak dapat dibuka di browser ini.", "error");
+            }
+        }, 120));
     }
 
     function configureReportFilter() {
@@ -2646,11 +2866,11 @@
             grid.appendChild(card);
             new QRCode(document.getElementById(`qr-canvas-${w.id}`), {text:w.id,width:95,height:95,colorDark:"#000000",colorLight:"#ffffff"});
         });
-        setTimeout(() => {
-            window.print();
+        window.addEventListener("afterprint", () => {
             printArea.classList.add("hidden");
-            document.getElementById("sec-app").classList.remove("hidden");
-        }, 500);
+            document.getElementById("sec-app")?.classList.remove("hidden");
+        }, {once:true});
+        requestAnimationFrame(() => setTimeout(() => window.print(), 120));
     }
 
     function exportDataJson() {
@@ -2747,7 +2967,7 @@
             APP_STATE.online = true;
             updateNetworkStatus();
             await flushOfflineQueue().catch(() => {});
-            if (APP_STATE.currentUser && realtimeUnsubs.length === 0) startRealtimeListeners();
+            if (APP_STATE.currentUser && realtimeUnsubs.length === 0) startRealtimeListeners().catch(() => {});
             showToast("Koneksi internet aktif kembali.");
         });
         window.addEventListener("offline", () => {
@@ -2843,9 +3063,16 @@
             }
 
             firebaseApp = initializeApp(firebaseConfig);
-            firebaseAuth = getAuth(firebaseApp);
+            try {
+                firebaseAuth = initializeAuth(firebaseApp, {
+                    persistence: [indexedDBLocalPersistence, browserLocalPersistence]
+                });
+            } catch (authInitError) {
+                console.warn("IndexedDB Auth fallback:", authInitError?.message || authInitError);
+                firebaseAuth = getAuth(firebaseApp);
+                await setPersistence(firebaseAuth, browserLocalPersistence);
+            }
             db = getDatabase(firebaseApp);
-            await setPersistence(firebaseAuth, browserLocalPersistence);
 
             updateFirebaseSettingsPanel();
 
