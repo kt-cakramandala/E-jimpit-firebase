@@ -1,4 +1,4 @@
-const CACHE_NAME = "ejimpitan-v7.1-20260921";
+const CACHE_NAME = "ejimpitan-v7.2-20260921";
 const APP_SHELL = [
   "./",
   "./index.html",
