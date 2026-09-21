@@ -1,0 +1,26 @@
+{
+  "name": "E-Jimpitan Panggungrejo Utara",
+  "short_name": "E-Jimpitan",
+  "description": "Aplikasi E-Jimpitan Warga Pekon Panggungrejo Utara",
+  "lang": "id-ID",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#f8fafc",
+  "theme_color": "#16a34a",
+  "orientation": "portrait-primary",
+  "icons": [
+    {
+      "src": "https://cdn-icons-png.flaticon.com/512/2784/2784459.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "https://cdn-icons-png.flaticon.com/512/2784/2784459.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}
