@@ -1,7 +1,7 @@
 {
   "name": "E-Jimpitan Panggungrejo Utara",
   "short_name": "E-Jimpitan",
-  "description": "Sistem Informasi dan E-Jimpitan Warga Pekon Panggungrejo Utara",
+  "description": "Aplikasi E-Jimpitan Warga Pekon Panggungrejo Utara",
   "lang": "id-ID",
   "start_url": "./",
   "scope": "./",
